@@ -1,0 +1,17 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+/doc/
+/Meta/
+src/*.o
+src/*.so
+src/*.dll
+
+vignettes/*_cache/
+vignettes/*_files/
+analysis/cache/
+vignettes/*_cache/
+vignettes/*_files/
+vignettes/*.html
+reCYCLing_*.tar.gz

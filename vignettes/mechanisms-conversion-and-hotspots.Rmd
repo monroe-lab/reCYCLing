@@ -1,0 +1,294 @@
+---
+title: "Gene conversion and hotspot feedback"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Gene conversion and hotspot feedback}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  fig.width  = 7,
+  fig.height = 3.5,
+  out.width  = "100%",
+  dpi = 150
+)
+set.seed(42)
+library(data.table)
+library(ggplot2)
+library(reCYCLing)
+```
+
+The other vignettes run the simulator with its default settings, which means two
+of its mechanisms are switched off. This vignette turns them on:
+
+| Mechanism | Parameters | What it does |
+|---|---|---|
+| **Non-allelic gene conversion** | `p_conversion`, `conv_dist`, `conv_tract`, `p_conv_interchrom` | Overwrites one monomer's sequence with another's. Homogenizes **without changing array length**. |
+| **Hotspot feedback** | `hotspot_alpha` | Makes local duplication rich-get-richer: big identical families duplicate more often. **Redistributes** duplications without adding any. |
+
+Both are off by default (`p_conversion = 0`, `hotspot_alpha = 0`), and with
+those defaults the engine reproduces the released behaviour exactly.
+
+---
+
+## Gene conversion
+
+In a gene conversion event a **recipient** monomer's sequence is overwritten by
+a **donor** monomer's sequence. Nothing is inserted and nothing is removed, so
+unlike duplication and deletion, conversion changes *what* is in the array
+without changing *how much* is in it. Its effect is homogenization: copies of
+the donor sequence replace diverged neighbours, so the array loses diversity but
+keeps its size.
+
+Three parameters control it at the array level (`sim_array()`) and at the genome
+level (`sim_genome()`):
+
+- **`p_conversion`** — per-monomer per-generation probability that a monomer is
+  a conversion recipient.
+- **`conv_dist`** — the distribution of **donor–recipient separation**, in
+  monomers. Default `gamma(shape = 1, scale = 20)`, i.e. donors are typically
+  a few tens of monomers away.
+- **`conv_tract`** — the distribution of **tract length**, i.e. how many
+  consecutive monomers are overwritten by a single event. Default
+  `gamma(shape = 1, scale = 1)`, i.e. usually a single monomer.
+
+### The length contract
+
+The cleanest way to see that conversion does not change array size is to switch
+off every mechanism that *can* change it. With `p_local_dup = 0` and
+`p_distal_dup = 0` the size governor has no duplication mass to balance, so it
+deletes nothing and each chromosome sits exactly on its target.
+
+```{r conv_length}
+TARGETS <- rep(300L, 3L)
+
+static_genome <- function(p_conversion, seed = 11, ...) {
+  set.seed(seed)
+  sim_genome(K = 3L, target_sizes = TARGETS, n_generations = 400L,
+             mu_total = 1e-4, init_l = 178L,
+             p_local_dup = 0, p_distal_dup = 0, p_exchange = 0,
+             p_conversion = p_conversion, ...)
+}
+
+plain <- static_genome(0)
+conv  <- static_genome(5e-3)
+
+data.table(
+  run          = c("no conversion", "conversion"),
+  monomers     = c(nrow(plain), nrow(conv)),
+  distinct_seq = c(uniqueN(plain$bponly), uniqueN(conv$bponly))
+)
+```
+
+Identical monomer counts, but far fewer distinct sequences once conversion is
+on: the array has been homogenized in place. Turning the rate up homogenizes
+further.
+
+```{r conv_rate}
+rates <- c(0, 5e-4, 2e-3, 5e-3)
+data.table(
+  p_conversion = rates,
+  distinct_seq = vapply(rates, function(p) uniqueN(static_genome(p)$bponly), 0L)
+)
+```
+
+### Tract length
+
+`conv_tract` sets how many consecutive monomers one event overwrites. Longer
+tracks convert more sequence per event, so at a fixed `p_conversion` a longer
+tract homogenizes faster — and still without any length change.
+
+```{r conv_tract}
+tracts <- c(1, 3, 10)
+data.table(
+  tract        = tracts,
+  monomers     = vapply(tracts, function(v)
+    nrow(static_genome(2e-3, conv_tract = list(type = "fixed", value = v))), 0L),
+  distinct_seq = vapply(tracts, function(v)
+    uniqueN(static_genome(2e-3, conv_tract = list(type = "fixed", value = v))$bponly), 0L)
+)
+```
+
+### Conversion between chromosomes
+
+At the genome level, `p_conv_interchrom` is the **fraction of conversion events
+whose donor is drawn from a different chromosome** rather than from `conv_dist`
+on the same one. The remaining `1 - p_conv_interchrom` follow the
+within-chromosome path.
+
+This gives a second, quite different route to cross-chromosome identical
+monomers. Inter-chromosomal *exchange* (`p_exchange`) physically copies a
+contiguous block from one chromosome into another. Inter-chromosomal
+*conversion* copies only sequence, one short tract at a time, into positions
+that are already occupied — so identical monomers appear on both chromosomes
+with no block having moved and no length change.
+
+```{r interchrom}
+n_cross_chrom <- function(g) nrow(g[, .(nc = uniqueN(chrom)), by = bponly][nc > 1])
+
+within <- static_genome(5e-3, p_conv_interchrom = 0)
+across <- static_genome(5e-3, p_conv_interchrom = 1)
+
+data.table(
+  p_conv_interchrom = c(0, 1),
+  monomers          = c(nrow(within), nrow(across)),
+  exchange_events   = c(attr(within, "n_exchange"), attr(across, "n_exchange")),
+  shared_seqs       = c(n_cross_chrom(within), n_cross_chrom(across))
+)
+```
+
+With `p_exchange = 0` there is no exchange event anywhere in the run, yet
+`p_conv_interchrom = 1` still produces sequences carried by more than one
+chromosome.
+
+The two routes leave different signatures. What differs is not *whether* shared
+monomers appear but how they are arranged along the chromosome: exchange leaves
+them in contiguous runs (the block that moved), conversion leaves them
+essentially isolated. Measuring the mean length of a run of consecutive
+cross-chromosome-shared monomers shows the difference:
+
+```{r scatter_vs_block}
+shared_run_length <- function(g) {
+  shared <- g[, .(nc = uniqueN(chrom)), by = bponly][nc > 1, bponly]
+  runs <- g[, {
+    r <- rle(bponly %in% shared)
+    .(len = r$lengths[r$values])
+  }, by = chrom]$len
+  data.table(n_shared = sum(g$bponly %in% shared), mean_run = mean(runs))
+}
+
+routes <- rbindlist(lapply(1:3, function(s) {
+  set.seed(s)
+  by_conv <- sim_genome(K = 3L, target_sizes = rep(400L, 3L), n_generations = 400L,
+                        mu_total = 1e-4, init_l = 178L, p_exchange = 0,
+                        p_conversion = 5e-3, p_conv_interchrom = 1)
+  set.seed(s)
+  by_xch  <- sim_genome(K = 3L, target_sizes = rep(400L, 3L), n_generations = 400L,
+                        mu_total = 1e-4, init_l = 178L,
+                        p_exchange = 0.2, exchange_chunk_mean = 200)
+  rbind(cbind(route = "conversion", shared_run_length(by_conv)),
+        cbind(route = "exchange",   shared_run_length(by_xch)))
+}))
+
+routes[, .(n_shared = mean(n_shared), mean_run = round(mean(mean_run), 2)), by = route]
+```
+
+Runs of shared monomers are roughly twice as long under exchange. The contrast
+is blunted by mutation — an exchanged block stops being identical monomer by
+monomer as it ages — so it is the recently exchanged blocks that carry the
+contiguous signal.
+
+A practical caveat: homogenization by unbiased conversion runs on a coalescent
+timescale proportional to (array size)/rate, so the inter-chromosomal path
+*seeds* cross-chromosome sharing rather than building deep identical families
+across chromosomes.
+
+---
+
+## Hotspot feedback
+
+By default every monomer triggers a local duplication with the same probability
+`p_local_dup`, so duplications land uniformly along the array. `hotspot_alpha`
+makes that probability depend on how successful a monomer's sequence already is:
+
+$$p_i \;\propto\; (\text{same-chromosome identical-family size of monomer } i)^{\alpha}$$
+
+and the whole vector is then **rescaled so that the expected number of
+duplication events per chromosome is unchanged**. This is the important part:
+`hotspot_alpha` is *mean-preserving*. It does not add duplication mass — it only
+decides where that mass lands, concentrating it on families that are already
+large. That is a rich-get-richer feedback which builds hotspots, and because the
+mean is preserved it is not confounded with `p_local_dup` and does not disturb
+the size governor's balance.
+
+Family membership is tracked by **lineage**: every copy (local, distal,
+exchanged, converted) joins its source's family, and a monomer **leaves its
+family as soon as it accumulates a substitution**. So families are transient —
+they grow by duplication and are eroded by mutation.
+
+`hotspot_alpha = 0` disables the mechanism entirely and reproduces the released
+behaviour exactly.
+
+```{r hotspot_sims}
+hot_sim <- function(alpha, seed) {
+  set.seed(seed)
+  sim_genome(K = 2L, target_sizes = rep(400L, 2L), n_generations = 400L,
+             mu_total = 1e-4, init_l = 178L,
+             p_local_dup = 5e-3,
+             local_dist = list(type = "fixed", value = 1),
+             del_dist   = list(type = "fixed", value = 1),
+             hotspot_alpha = alpha)
+}
+
+runs <- CJ(alpha = c(0, 3), seed = 1:3)[, .(g = list(hot_sim(alpha, seed))),
+                                        by = .(alpha, seed)]
+
+fams <- runs[, .(family_size = g[[1]][, .N, by = .(chrom, bponly)]$N),
+             by = .(alpha, seed)]
+sizes <- runs[, .(total = nrow(g[[1]])), by = .(alpha, seed)]
+
+merge(sizes[, .(monomers = mean(total)), by = alpha],
+      fams[, .(largest_family = max(family_size),
+               families_ge_5  = sum(family_size >= 5)), by = alpha], by = "alpha")
+```
+
+Two things happen at once. The largest identical family gets substantially
+bigger with the feedback on — but the standing monomer count barely moves,
+because the governor's deletion rate is derived from `p_local_dup` and the
+feedback did not change how many duplications happened, only which monomers they
+happened to.
+
+```{r hotspot_plot}
+ggplot(fams[family_size > 1],
+       aes(x = family_size, fill = factor(alpha))) +
+  geom_histogram(binwidth = 1, boundary = 0.5, position = "identity",
+                 alpha = 0.55) +
+  scale_x_continuous(breaks = seq(2, 14, 2)) +
+  scale_y_continuous(trans = "log1p", breaks = c(0, 1, 3, 10, 30, 100, 300)) +
+  scale_fill_manual(values = c("0" = "grey40", "3" = "firebrick"),
+                    name = "hotspot_alpha") +
+  labs(x = "identical family size (monomers)", y = "number of families",
+       title = "Hotspot feedback lengthens the tail of the family-size distribution") +
+  theme_classic()
+```
+
+The feedback does not change the number of duplication events; it changes their
+distribution, pushing the family-size distribution's tail out to the right.
+
+---
+
+## Using both together
+
+The two mechanisms are independent and compose freely, and — as everywhere else
+in the package — a fixed seed reproduces a run exactly.
+
+```{r combined}
+both <- function() {
+  set.seed(99)
+  sim_genome(K = 3L, target_sizes = TARGETS, n_generations = 400L,
+             mu_total = 1e-4, init_l = 178L,
+             p_conversion = 3e-3, p_conv_interchrom = 0.5,
+             hotspot_alpha = 2)
+}
+identical(both(), both())
+```
+
+---
+
+## Parameter reference
+
+| Parameter | Function | Default | Meaning |
+|---|---|---|---|
+| `p_conversion` | `sim_array()`, `sim_genome()` | `0` | Per-monomer per-generation conversion probability |
+| `conv_dist` | `sim_array()`, `sim_genome()` | `gamma(1, 20)` | Donor–recipient separation, in monomers |
+| `conv_tract` | `sim_array()`, `sim_genome()` | `gamma(1, 1)` | Tract length, in monomers |
+| `p_conv_interchrom` | `sim_genome()` | `0` | Fraction of conversions whose donor is on another chromosome |
+| `hotspot_alpha` | `sim_genome()` | `0` | Exponent of the mean-preserving local-duplication feedback |
+
+Note that gene conversion is implemented in the C++ backend only; in
+`sim_array()` it therefore requires `backend = "auto"` (the default for
+substitution-only runs) or `backend = "cpp"`.

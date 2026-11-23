@@ -1,0 +1,418 @@
+---
+title: "Equilibrium dynamics in tandem repeat arrays"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Equilibrium dynamics in tandem repeat arrays}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  fig.width  = 8,
+  fig.height = 4,
+  out.width  = "100%",
+  dpi = 150
+)
+set.seed(42)
+library(data.table)
+library(ggplot2)
+library(reCYCLing)
+```
+
+## The growth problem
+
+In the standard reCYCLing simulation, a tandem repeat array grows from a small
+initial copy number until it reaches a target size (`max_units`). But in real
+genomes, repeat arrays don't grow without bound — they reach a characteristic
+size that reflects a balance between expansion and contraction forces.
+
+Can we reproduce this equilibrium in simulation?
+
+## Two kinds of duplication, one kind of deletion
+
+The simulator has three forces that change array size:
+
+| Force | Rate type | Effect on size |
+|-------|-----------|----------------|
+| **Local duplication** | Per-unit per-gen | Grows faster as array gets bigger |
+| **Distal duplication** | Per-array per-gen | Constant injection regardless of size |
+| **Chunk deletion** | Per-unit per-gen | Shrinks faster as array gets bigger |
+
+Local duplication and deletion both scale with array size. If their rates and
+chunk sizes are similar, they roughly cancel — but the array does a random walk
+that eventually hits zero (extinction).
+
+**Distal duplication is the key to equilibrium.** Because it's a per-array event
+(one crossover per generation, independent of array size), it acts as a constant
+source of new material. As the array grows, per-unit deletion increases until it
+balances the distal input. The result: a stable equilibrium size.
+
+## Demonstrating equilibrium
+
+Let's run simulations with different deletion rates while keeping distal
+duplication fixed, and watch the array size over time.
+
+```{r equilibrium_sims, cache=TRUE}
+params <- list(
+  list(name = "Low deletion (5e-6)",    pdel = 5e-6),
+  list(name = "Medium deletion (5e-5)", pdel = 5e-5),
+  list(name = "High deletion (7e-5)",   pdel = 7e-5),
+  list(name = "Very high deletion (2e-4)", pdel = 2e-4)
+)
+
+trajectories <- rbindlist(lapply(params, function(p) {
+  sim <- suppressWarnings(sim_array(
+    max_units = 200000, max_generations = 5000, hard_cap = 200000,
+    init_l = 178, init_k0 = 10,
+    p_local_dup = 1e-5,      # low local dup
+    p_distal_dup = 0.05,     # 5% chance of crossover per generation
+    p_del_chunk = p$pdel,
+    mu_total = 5e-5,
+    verbose = FALSE, compute_pairs = FALSE
+  ))
+  data.table(
+    gen = seq_along(sim$L_vec),
+    size = sim$L_vec,
+    scenario = p$name
+  )
+}))
+```
+
+```{r plot_trajectories, fig.height=5}
+ggplot(trajectories, aes(x = gen, y = size, colour = scenario)) +
+  geom_line(linewidth = 0.5, alpha = 0.8) +
+  scale_y_log10(labels = scales::comma) +
+  theme_classic(base_size = 12) +
+  labs(x = "Generation", y = "Array size (monomers)",
+       colour = "Deletion rate",
+       title = "Array size trajectories under different deletion rates",
+       subtitle = "Distal dup = 0.05/gen, local dup = 1e-5/unit/gen") +
+  theme(legend.position = "bottom")
+```
+
+With low deletion, the array grows without bound. With higher deletion rates,
+the array reaches an equilibrium size where distal duplication input balances
+deletion loss. The equilibrium size decreases as deletion rate increases.
+
+## Equilibrium size depends on the balance of forces
+
+Let's measure the equilibrium size across a range of deletion rates.
+
+```{r eq_sweep, cache=TRUE}
+del_rates <- 10^seq(-5.5, -3, by = 0.25)
+
+eq_data <- rbindlist(lapply(del_rates, function(pdel) {
+  sim <- suppressWarnings(sim_array(
+    max_units = 200000, max_generations = 5000, hard_cap = 200000,
+    init_l = 178, init_k0 = 10,
+    p_local_dup = 1e-5, p_distal_dup = 0.05,
+    p_del_chunk = pdel, mu_total = 5e-5,
+    verbose = FALSE, compute_pairs = FALSE
+  ))
+  lv <- sim$L_vec
+  n <- length(lv)
+  # Use last 20% as equilibrium estimate
+  tail_start <- max(1, as.integer(n * 0.8))
+  tail_vals <- lv[tail_start:n]
+  data.table(
+    p_del = pdel,
+    eq_size = mean(tail_vals),
+    eq_sd = sd(tail_vals),
+    n_gens = n,
+    final = lv[n]
+  )
+}))
+```
+
+```{r plot_eq_size}
+ggplot(eq_data, aes(x = p_del, y = eq_size)) +
+  geom_pointrange(aes(ymin = eq_size - eq_sd, ymax = eq_size + eq_sd)) +
+  scale_x_log10() +
+  scale_y_log10(labels = scales::comma) +
+  theme_classic(base_size = 12) +
+  labs(x = "Deletion rate (per unit per gen)",
+       y = "Equilibrium array size",
+       title = "Equilibrium size vs deletion rate",
+       subtitle = "Error bars = SD of size in last 20% of trajectory")
+```
+
+The relationship is roughly inverse: doubling the deletion rate halves the
+equilibrium size. This makes intuitive sense — the equilibrium occurs where
+total deletion rate (per-unit rate × array size) equals the distal duplication
+input.
+
+## Tracking array properties over time
+
+To understand how the array evolves toward equilibrium, we can track multiple
+properties over time: array size, mutation load, and monomer diversity. We'll
+sample these at regular checkpoints by running the simulation in stages.
+
+```{r time_series, cache=TRUE}
+library(cowplot)
+
+# Run equilibrium sim with checkpoints every 100 gens
+# Lower mutation rate for more realistic load values
+max_gen <- 3000
+checkpoint_every <- 100
+checkpoints <- seq(checkpoint_every, max_gen, by = checkpoint_every)
+
+# We'll run the full sim once, then use L_vec for size trajectory.
+# For load and diversity, we need to run in stages using the R backend.
+sim_eq <- suppressWarnings(sim_array(
+  max_units = 200000, max_generations = max_gen, hard_cap = 200000,
+  init_l = 178, init_k0 = 10,
+  p_local_dup = 1e-5, p_distal_dup = 0.05,
+  p_del_chunk = 7e-5, mu_total = 1e-5,
+  verbose = FALSE, compute_pairs = FALSE
+))
+
+# Size trajectory from L_vec
+traj_dt <- data.table(gen = seq_along(sim_eq$L_vec), size = sim_eq$L_vec)
+
+# For the final state, compute load and copy number
+mono <- sim_eq$monomers
+ct <- counts_long_nogap(mono$bponly)
+cons <- ct[symbol == consensus][order(pos)]
+load <- mu_load_from_consensus(mono$bponly, cons)
+
+cat("Final array size:", nrow(mono), "\n")
+cat("Generations:", length(sim_eq$L_vec), "\n")
+cat("Mean mutation load:", round(mean(load), 1), "\n")
+cat("Unique sequences:", uniqueN(mono$bponly), "\n")
+
+# Copy number distribution
+cn <- mono[, .N, by = bponly][order(-N)]
+cat("Mean copy number:", round(mean(cn$N), 1), "\n")
+cat("Max copy number:", max(cn$N), "\n")
+```
+
+```{r plot_trajectory, fig.height=3}
+ggplot(traj_dt, aes(x = gen, y = size)) +
+  geom_line(colour = "steelblue", linewidth = 0.5) +
+  theme_classic(base_size = 11) +
+  labs(x = "Generation", y = "Array size (monomers)",
+       title = "Array size over time — approach to equilibrium")
+```
+
+The array rapidly expands in the first few hundred generations, then fluctuates
+around an equilibrium size determined by the balance of duplication and deletion.
+
+## Mutation load and diversity at the final state
+
+```{r final_state_plots, fig.height=8}
+p_load <- ggplot(data.frame(load = load), aes(x = load)) +
+  geom_histogram(bins = 40, fill = "firebrick", alpha = 0.7, colour = "white") +
+  geom_vline(xintercept = mean(load), linetype = "dashed") +
+  theme_classic(base_size = 11) +
+  labs(x = "Mismatches to consensus", y = "Count",
+       title = paste0("Mutation load (mean = ", round(mean(load), 1), ")"))
+
+p_cn <- ggplot(cn, aes(x = N)) +
+  geom_histogram(bins = 50, fill = "darkorange", alpha = 0.7, colour = "white") +
+  scale_x_log10() +
+  theme_classic(base_size = 11) +
+  labs(x = "Copies per unique sequence", y = "Count",
+       title = paste0("Copy number distribution (", nrow(cn), " unique sequences)"))
+
+# Shannon entropy as a single number
+H <- shannon_entropy(mono$bponly)
+p_info <- ggplot() + theme_void() +
+  annotate("text", x = 0.5, y = 0.7, size = 5,
+           label = paste0("Array size: ", nrow(mono))) +
+  annotate("text", x = 0.5, y = 0.5, size = 5,
+           label = paste0("Shannon entropy: ", round(H, 2), " bits")) +
+  annotate("text", x = 0.5, y = 0.3, size = 5,
+           label = paste0("Unique sequences: ", uniqueN(mono$bponly),
+                          " / ", nrow(mono)))
+
+plot_grid(p_load, p_cn, p_info, ncol = 1, rel_heights = c(1, 1, 0.5))
+```
+
+## Comparing different evolutionary ages
+
+How do array properties change with time? Let's run simulations of different
+lengths and compare.
+
+```{r age_comparison, cache=TRUE}
+ages <- c(500, 1000, 2000, 3000, 5000)
+
+age_stats <- rbindlist(lapply(ages, function(t_max) {
+  sim <- suppressWarnings(sim_array(
+    max_units = 200000, max_generations = t_max, hard_cap = 200000,
+    init_l = 178, init_k0 = 10,
+    p_local_dup = 1e-5, p_distal_dup = 0.05,
+    p_del_chunk = 7e-5, mu_total = 1e-5,
+    verbose = FALSE, compute_pairs = FALSE
+  ))
+  m <- sim$monomers
+  if (nrow(m) < 10) return(NULL)
+  ct <- tryCatch(counts_long_nogap(m$bponly), error = function(e) NULL)
+  if (is.null(ct)) return(NULL)
+  cons <- ct[symbol == consensus][order(pos)]
+  ld <- mu_load_from_consensus(m$bponly, cons)
+  cn <- m[, .N, by = bponly]
+  data.table(
+    generations = t_max,
+    array_size = nrow(m),
+    mean_load = mean(ld),
+    median_load = median(ld),
+    n_unique = uniqueN(m$bponly),
+    mean_copy_number = mean(cn$N),
+    max_copy_number = max(cn$N),
+    entropy = shannon_entropy(m$bponly)
+  )
+}))
+
+print(age_stats)
+```
+
+```{r plot_age_comparison, fig.height=8}
+age_long <- melt(age_stats,
+  id.vars = "generations",
+  measure.vars = c("array_size", "mean_load", "mean_copy_number", "entropy"))
+
+ggplot(age_long, aes(x = generations, y = value)) +
+  geom_point(size = 3, colour = "steelblue") +
+  geom_line(colour = "steelblue", linewidth = 0.8) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 1) +
+  theme_classic(base_size = 11) +
+  theme(strip.background = element_blank(), strip.text = element_text(face = "bold")) +
+  labs(x = "Generations of evolution", y = NULL,
+       title = "Array properties across evolutionary time")
+```
+
+Key observations:
+
+- **Array size** rapidly reaches equilibrium (within ~500 gens) and then
+  fluctuates around a stable value.
+- **Mutation load** increases roughly linearly with time, as expected from
+  `mu × init_l × generations`.
+- **Mean copy number** may initially increase (duplication homogenises) then
+  decrease as mutations diversify.
+- **Entropy** increases over time as mutation creates diversity, modulated by
+  duplication events that temporarily reduce it.
+
+## The fingerprint at equilibrium
+
+What does the identical-pair structure look like when the array has been
+evolving at equilibrium for different lengths of time?
+
+```{r fingerprint_eq, fig.height=8, cache=TRUE}
+sim_eq_with_pairs <- sim_eq
+sim_eq_with_pairs$pairs <- pairs_identical(mono)
+
+plot_array_summary(sim_eq_with_pairs,
+  title = paste0("Equilibrium array (", length(sim_eq$L_vec), " gens)"))
+```
+
+## From fossils to simulations: the molecular clock
+
+We can ground the simulation in real evolutionary time using empirical
+observations. Here is the logic chain for pistachio knob repeats:
+
+**Known quantities:**
+
+| Observation | Value | Source |
+|-------------|-------|--------|
+| Ancestor age | ~10 million years | Phylogenetic dating |
+| Generation time | ~10 years | Age to reproductive maturity |
+| Generations of evolution | ~1,000,000 | 10M yr / 10 yr |
+| Monomer length | 178 bp | Sequence data |
+| Observed mean mutation load | ~10 mismatches | Empirical from arrays |
+| Observed array size | ~20,000 units | Genome assembly |
+
+**Deriving the per-base mutation rate:**
+
+Since `mean_load ≈ mu_per_base × monomer_length × generations`:
+
+```
+10 ≈ mu × 178 × 1,000,000
+mu ≈ 5.6 × 10^-8 per base per generation
+```
+
+This falls squarely within the empirical range for plant per-base mutation
+rates (10^-8 to 10^-9), providing independent validation.
+
+**Time compression for simulation:**
+
+We cannot feasibly simulate 1,000,000 generations directly. Instead, we
+compress time by scaling the mutation rate up and the generation count down,
+preserving the product `mu × t`:
+
+| | Real | Compressed (1000×) |
+|-|------|--------------------|
+| Mutation rate | 5.6 × 10^-8 | 5.6 × 10^-5 |
+| Generations | 1,000,000 | 1,000 |
+| mu × t product | 0.056 | 0.056 |
+| Expected load (178bp) | 10.0 | 10.0 |
+
+All per-generation rates (duplication, deletion) scale by the same compression
+factor, so the *effective* rates in the compressed simulation are 1000× the
+real rates.
+
+```{r clock_demo, cache=TRUE}
+# Demonstrate: compressed simulation produces the same load
+mu_real <- 5.6e-8
+compression <- 1000
+mu_compressed <- mu_real * compression
+t_compressed <- 1000  # = 1M real gens / 1000
+
+sim_clock <- suppressWarnings(sim_array(
+  max_units = 200000, max_generations = t_compressed, hard_cap = 200000,
+  init_l = 178, init_k0 = 10,
+  p_local_dup = 1e-5, p_distal_dup = 0.05,
+  p_del_chunk = 7e-5, mu_total = mu_compressed,
+  verbose = FALSE, compute_pairs = FALSE
+))
+
+mono_clock <- sim_clock$monomers
+ct_clock <- counts_long_nogap(mono_clock$bponly)
+cons_clock <- ct_clock[symbol == consensus][order(pos)]
+load_clock <- mu_load_from_consensus(mono_clock$bponly, cons_clock)
+
+cat("Compressed simulation:\n")
+cat("  Generations:", length(sim_clock$L_vec), "\n")
+cat("  Array size:", nrow(mono_clock), "\n")
+cat("  Mean mutation load:", round(mean(load_clock), 1), "\n")
+cat("  Expected load (mu × l × t):", round(mu_compressed * 178 * length(sim_clock$L_vec), 1), "\n")
+```
+
+## Implications for inference
+
+Since 1.9.0 the package is purely a simulator — inference (e.g. ABC) lives in
+project-specific analysis code that scores the simulated arrays. The molecular
+clock framework still shapes how such an inference should be set up:
+
+**What is fixed (known from data):**
+
+- `mu_total` — derived from mutation rate × compression factor
+- `max_generations` — derived from ancestor age / generation time / compression factor
+- `init_l` — monomer length from sequence data
+- Target mutation load — from empirical observation (~10)
+- Target array size — from genome assembly (~20,000)
+
+**What the ABC infers:**
+
+- `p_local_dup` — tandem duplication rate (per-unit)
+- `p_distal_dup` — crossover/distal duplication rate (per-array)
+- `p_del_chunk` — deletion rate (per-unit)
+- Chunk-size distribution parameters (shape, scale for each)
+
+**The key insight:** The simulation no longer grows to a target size and stops.
+Instead, it runs for a fixed number of generations (representing real
+evolutionary time) and the ABC compares the *resulting* array against
+observations:
+
+- Does it reach the right size? → constrains deletion/duplication balance
+- Does it have the right distance distribution? → constrains chunk sizes
+- Does it have the right mutation load? → already locked by the clock
+- Does it show bimodal pair distances? → confirms local + distal mechanisms
+
+The equilibrium model means the array size is an emergent property of the
+parameter combination, not an input. This is more biologically realistic
+and provides stronger parameter identifiability — there is no longer a
+degeneracy between "fast rates, few generations" and "slow rates, many
+generations" because the number of generations is fixed by the fossil record.

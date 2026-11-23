@@ -1,0 +1,10 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^extra$
+^\.git$
+^doc$
+^Meta$
+^vignettes/.*_cache$
+^vignettes/.*_files$
+^vignettes/.*\.html$
+^analysis$

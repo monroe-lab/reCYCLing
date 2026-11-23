@@ -1,0 +1,259 @@
+---
+title: "Introduction to reCYCLing"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Introduction to reCYCLing}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  fig.width  = 7,
+  fig.height = 4.5,
+  out.width  = "100%",
+  dpi       = 300
+)
+set.seed(42)
+library(data.table)
+```
+
+## Overview
+
+**reCYCLing** simulates the evolution of tandem repeat arrays—sequences where
+a short monomer unit is repeated many times in a row, as found in satellite DNA,
+centromeric repeats, and other genomic repeat elements.
+
+Starting from a small array of identical monomers, the simulator applies four
+forces each generation:
+
+| Process | Controls |
+|---|---|
+| **Local duplication** | Tandem copy–paste of a nearby chunk |
+| **Distal duplication** | Copy–paste to a more distant position in the array |
+| **Chunk deletion** | Removal of a block of consecutive monomers |
+| **Per-base mutation** | Substitutions (and optionally indels) within each monomer |
+
+---
+
+## Running a simulation
+
+```{r run_sim}
+library(reCYCLing)
+
+# Define a fixed ancestral monomer so results are reproducible
+ancestor <- paste(sample(c("A","C","G","T"), 178, replace = TRUE),
+                  collapse = "")
+
+sim <- sim_array(
+  init_l             = 178,       # monomer length (bp)
+  init_k0            = 10,        # starting copy number
+  init_sequence_type = "given",
+  ancestor_seq       = ancestor,
+  max_units          = 10000,     # stop when array reaches 10 000 monomers
+  mu_total           = 5e-5,      # per-base mutation rate
+  p_local_dup        = 0.0004,    # local duplication probability per unit
+  p_distal_dup       = 1e-5,      # distal duplication probability per unit
+  p_del_chunk        = 1e-5,      # deletion probability per unit
+  verbose            = FALSE
+)
+```
+
+---
+
+## Understanding the output
+
+`sim_array()` returns a named list with five elements:
+
+```{r output_structure}
+names(sim)
+```
+
+### `monomers` — the final array
+
+A `data.table` with one row per monomer in the final array.
+
+```{r monomers}
+head(sim$monomers)
+nrow(sim$monomers)   # total monomers in the final array
+```
+
+| Column | Description |
+|---|---|
+| `num` | Position index along the array (1 = first monomer) |
+| `bponly` | The monomer DNA sequence |
+| `dir` | Strand direction (`+` or `-`; reflects inversions from distal duplication) |
+
+```{r monomers_summary}
+# How many unique sequences are in the array?
+length(unique(sim$monomers$bponly))
+
+# Shannon entropy — higher = more diversity among monomers
+shannon_entropy(sim$monomers$bponly)
+```
+
+### `pairs` — all pairs of identical monomers
+
+A `data.table` of every unordered pair of monomers that share the same
+sequence. This is the foundation of the fingerprint plot.
+
+```{r pairs}
+head(sim$pairs[, c("bponly", "num1", "num2")])
+nrow(sim$pairs)   # total number of identical pairs
+```
+
+### Trajectory vectors — how the array evolved over time
+
+```{r trajectories}
+cat("Generations simulated:", length(sim$L_vec), "\n")
+cat("Starting size:", sim$L_vec[1], "| Final size:", tail(sim$L_vec, 1), "\n")
+```
+
+```{r traj_plot, fig.height=3}
+library(ggplot2)
+
+traj <- data.frame(gen = seq_along(sim$L_vec), size = sim$L_vec)
+
+ggplot(traj, aes(x = gen, y = size)) +
+  geom_line() +
+  theme_classic(base_size = 10) +
+  xlab("Generation") +
+  ylab("Array size (monomers)")
+```
+
+---
+
+## Visualising results
+
+Each diagnostic view of the array is available as its own plotting function.
+
+### Repeat fingerprint — dot-plot of identical pairs
+
+Each dot represents a pair of identical monomers, placed at their positions
+along both axes. Diagonal streaks near the main diagonal reflect local (tandem)
+duplications; off-diagonal clusters reveal distal duplications.
+
+```{r p_fingerprint, fig.height=6}
+plot_repeat_fingerprint(sim, ptsize = 0.01)
+```
+
+### Zooming in
+
+The full fingerprint compresses 10,000 positions into a single figure. Use the
+`zoom` parameter to inspect a sub-region in detail:
+
+```{r p_fingerprint_zoom, fig.height=6}
+plot_repeat_fingerprint(sim, zoom = c(4000, 5000), ptsize = 0.3,
+                        gridalpha = 0.3)
+```
+
+### Pair distances — separation between identical pairs
+
+The positional separation |num1 − num2| of every identical pair on a log10
+scale. A peak near 1 indicates mostly tandem (local) duplications; a heavy tail
+or second mode at larger distances indicates distal duplications were important.
+
+```{r p_dist}
+plot_pair_distances(sim)
+```
+
+### Copy numbers — copies per unique monomer sequence
+
+For each distinct monomer sequence, counts how many copies exist in the array.
+High copy numbers mean many monomers share an identical sequence—a signature of
+homogenisation by repeated duplication.
+
+```{r p_cn}
+plot_copy_numbers(sim)
+```
+
+### Mutation load — mismatches relative to consensus
+
+Computes the consensus sequence across all monomers and counts mismatches for
+each individual monomer. Monomers with load = 0 are identical to the consensus;
+higher loads indicate more diverged copies.
+
+```{r p_ml}
+plot_mutation_load(sim)
+```
+
+### Consensus support — per-position conservation
+
+At each alignment position, the proportion of monomers agreeing with the
+consensus base is plotted. Values near 1 mean that position is strongly
+conserved; a spread distribution indicates heterogeneity.
+
+```{r p_cs}
+plot_consensus_support(sim)
+```
+
+### Combined summary — all five panels at once
+
+`plot_array_summary()` assembles all five plots into a single figure using
+**cowplot**.
+
+```{r summary, fig.height=10}
+plot_array_summary(sim, title = "Single replicate summary")
+```
+
+---
+
+## Sharing pre-computed counts across plots
+
+`plot_mutation_load()` and `plot_consensus_support()` both compute per-position
+counts internally. If you call both, compute once and pass:
+
+```{r counts_reuse}
+counts <- counts_long_nogap(sim$monomers$bponly)
+
+p_ml <- plot_mutation_load(sim, counts = counts)
+p_cs <- plot_consensus_support(sim, counts = counts)
+```
+
+---
+
+## Comparing parameter settings
+
+A common use-case is running several simulations under different parameters and
+comparing the resulting entropy:
+
+```{r compare, eval=FALSE}
+sims <- lapply(c(1e-5, 1e-4), function(mu) {
+  sim_array(max_units = 300, mu_total = mu)
+})
+
+ent <- rbindlist(lapply(seq_along(sims), function(i) {
+  e <- get_sim_entropies(sims[[i]])
+  e$mu <- c("low", "high")[i]
+  e
+}))
+
+ggplot(ent, aes(x = mu, y = H)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  ylab("Shannon entropy (bits)")
+```
+
+---
+
+## Function reference
+
+| Function | Purpose |
+|---|---|
+| `sim_array()` | Run a single repeat-array evolution simulation |
+| `init_array()` | Initialise an array (used internally by the simulators) |
+| `pairs_identical()` | Find all pairs of identical monomers |
+| `counts_long_nogap()` | Per-position base counts across aligned monomers |
+| `mu_load_from_consensus()` | Mismatch count per monomer vs consensus |
+| `shannon_entropy()` | Entropy (bits) of a monomer distribution |
+| `get_sim_entropies()` | Entropy summary for a simulation result |
+| `plot_repeat_fingerprint()` | Dot-plot of identical pairs |
+| `plot_pair_distances()` | Distance distribution between identical pairs |
+| `plot_copy_numbers()` | Copy-number distribution per unique monomer |
+| `plot_mutation_load()` | Mutation load histogram |
+| `plot_consensus_support()` | Consensus support histogram |
+| `plot_array_summary()` | Combined five-panel summary figure |
+| `plot_repeat_barcode()` | Linear barcode of a zoom window |
+| `plot_circular_seqcounts()` | Circular base-composition plot |

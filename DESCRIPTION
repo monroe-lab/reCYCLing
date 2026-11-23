@@ -1,0 +1,33 @@
+Package: reCYCLing
+Type: Package
+Title: Repeat Element Cyclical Evolutionary Simulations in Genomes
+Version: 1.9.2
+Author: Grey Monroe [aut, cre]
+Maintainer: Grey Monroe <greymonroe@gmail.com>
+Description: Simulates the evolution of satellite DNA repeat arrays, from
+    single tandem arrays to whole multi-chromosome genomes, through local
+    (multi-monomer) duplication, long-range duplication, inter-chromosomal
+    exchange, non-allelic gene conversion (within- and between-chromosome),
+    governed deletion, and per-base mutation. Provides visualization tools
+    for repeat fingerprints, monomer diversity, and array composition.
+    Purely a simulator: summary statistics and inference (e.g. ABC) are
+    intentionally out of scope and belong in project-specific analysis code.
+License: GPL-3
+Encoding: UTF-8
+Imports:
+    cowplot,
+    data.table,
+    ggplot2,
+    grid,
+    Rcpp,
+    scales,
+    stats
+LinkingTo: Rcpp
+Suggests:
+    Biostrings,
+    knitr,
+    RColorBrewer,
+    rmarkdown,
+    testthat
+VignetteBuilder: knitr
+RoxygenNote: 7.3.3
